@@ -333,7 +333,6 @@ export function HeroSection() {
         setLoadPct(100);
         setInitialReady(true);
         renderFrame(0);
-        setActiveChapterIndex(0);
       });
       return () => {
         resizeObserver.disconnect();
