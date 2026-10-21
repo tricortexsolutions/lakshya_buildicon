@@ -121,7 +121,6 @@ export function HeroSection() {
   const trackRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const progressLineRef = useRef<HTMLDivElement>(null);
   // Direct DOM refs for chapter overlays and CTA — avoids React re-renders on every scroll tick
   const chapterRefsArr = useRef<(HTMLDivElement | null)[]>([]);
   const finalCtaRef = useRef<HTMLDivElement>(null);
@@ -358,11 +357,6 @@ export function HeroSection() {
         const p = self.progress;
         const pct = p * 100;
 
-        // ── Top progress indicator — direct DOM mutation, no React state ──
-        if (progressLineRef.current) {
-          progressLineRef.current.style.transform = `scaleX(${p})`;
-        }
-
         // ── Frame scrub — synchronous draw within GSAP's own RAF tick ──
         const targetFrame = Math.min(Math.round(p * (total - 1)), total - 1);
         if (targetFrame !== currentFrame) {
@@ -494,31 +488,6 @@ export function HeroSection() {
               pointerEvents: "none",
             }}
           />
-
-          {/* ══ Top Scroll Progress Bar ══ */}
-          <div
-            style={{
-              position: "absolute",
-              top: 0,
-              left: 0,
-              right: 0,
-              height: "2px",
-              background: "rgba(255, 255, 255, 0.08)",
-              zIndex: 40,
-            }}
-          >
-            <div
-              ref={progressLineRef}
-              style={{
-                height: "100%",
-                background: "linear-gradient(90deg, #B99A62, #E5CF92)",
-                transformOrigin: "left center",
-                transform: "scaleX(0)",
-                willChange: "transform",
-                boxShadow: "0 0 10px rgba(185, 154, 98, 0.6)",
-              }}
-            />
-          </div>
 
           {/* ══ Elegant Minimal Preloader ══ */}
           {!initialReady && (
