@@ -9,6 +9,23 @@ if (typeof window !== "undefined") {
   gsap.registerPlugin(ScrollTrigger);
 }
 
+// ── Helpers for direct-DOM chapter transitions (avoids React re-renders on scroll) ──
+function setChapterVisible(el: HTMLElement | null, visible: boolean) {
+  if (!el) return;
+  el.style.opacity = visible ? "1" : "0";
+  el.style.transform = visible ? "translateZ(0)" : "translate3d(0, 20px, 0)";
+  el.style.pointerEvents = visible ? "auto" : "none";
+}
+// Separate helper for the CTA element which needs translateX(-50%) preserved
+function setCtaVisible(el: HTMLElement | null, visible: boolean) {
+  if (!el) return;
+  el.style.opacity = visible ? "1" : "0";
+  el.style.transform = visible
+    ? "translateX(-50%) translateZ(0)"
+    : "translateX(-50%) translate3d(0, 20px, 0)";
+  el.style.pointerEvents = visible ? "auto" : "none";
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIGURATION — customize sequence source and track length here
 // ─────────────────────────────────────────────────────────────────────────────
@@ -105,11 +122,17 @@ export function HeroSection() {
   const stageRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const progressLineRef = useRef<HTMLDivElement>(null);
+  // Direct DOM refs for chapter overlays and CTA — avoids React re-renders on every scroll tick
+  const chapterRefsArr = useRef<(HTMLDivElement | null)[]>([]);
+  const finalCtaRef = useRef<HTMLDivElement>(null);
+  const navDotRefsArr = useRef<(HTMLDivElement | null)[]>([]);
+  const navLabelRefsArr = useRef<(HTMLSpanElement | null)[]>([]);
+  // Tracks current active chapter index without triggering a re-render
+  const activeChapterRef = useRef<number>(0);
+  const showFinalCtaRef = useRef<boolean>(false);
 
   const [loadPct, setLoadPct] = useState(0);
   const [initialReady, setInitialReady] = useState(false);
-  const [activeChapterIndex, setActiveChapterIndex] = useState(0);
-  const [showFinalCta, setShowFinalCta] = useState(false);
 
   // Check prefers-reduced-motion
   const isReducedMotion = useRef(
@@ -130,14 +153,22 @@ export function HeroSection() {
     const stage = stageRef.current;
     if (!canvas || !track || !stage) return;
 
-    const ctx = canvas.getContext("2d", { alpha: false });
+    // desynchronized: true allows the compositor to update the canvas out of sync with
+    // the main thread — eliminates GPU pipeline stalls during scroll scrubbing
+    const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
     if (!ctx) return;
+
+    // High-quality upscale rendering
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
 
     const total = HERO_CONFIG.totalFrames;
     const cache: (ImageBitmap | HTMLImageElement | null)[] = Array(total).fill(null);
     let loadedCount = 0;
     let currentFrame = 0;
-    let rafId: number | null = null;
+    let rafId: number | null = null;        // used ONLY for resize redraws
+    let pendingScrollFrame = -1;            // target frame requested by scroll
+    let scrollRafId: number | null = null;  // single RAF slot for scroll draws
     let scrollTriggerInstance: ScrollTrigger | null = null;
     let isFirstReady = false;
 
@@ -153,39 +184,64 @@ export function HeroSection() {
         canvas.width = pixelWidth;
         canvas.height = pixelHeight;
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        renderFrame(currentFrame);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        renderFrameAsync(currentFrame);
       }
     }
 
-    // Render frame to canvas with nearest-fallback logic
-    function renderFrame(index: number) {
+    // ── Core draw — fully synchronous, no RAF, called inside GSAP RAF tick ──────
+    // IMPORTANT: never wrap this in requestAnimationFrame when called from onUpdate;
+    // GSAP onUpdate already executes inside the browser's RAF. Adding another RAF
+    // would defer the draw by exactly 1 frame, causing visible lag on every scroll.
+    function drawFrameNow(index: number) {
       if (!canvas || !ctx) return;
-      if (rafId !== null) cancelAnimationFrame(rafId);
+      const clampedIdx = Math.max(0, Math.min(index, total - 1));
 
+      // Bidirectional nearest-loaded-frame search:
+      // Prefer the exact frame, then fan out equally in both directions.
+      // This prevents jumping to very old frames when the user scrolls fast.
+      let lo = clampedIdx;
+      let hi = clampedIdx + 1;
+      let found = -1;
+      while (lo >= 0 || hi < total) {
+        if (lo >= 0 && cache[lo] !== null) { found = lo; break; }
+        if (hi < total && cache[hi] !== null) { found = hi; break; }
+        lo--;
+        hi++;
+      }
+      if (found < 0) return;
+
+      const img = cache[found];
+      if (!img) return;
+
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const stageW = canvas.width / dpr;
+      const stageH = canvas.height / dpr;
+      ctx.clearRect(0, 0, stageW, stageH);
+      drawCover(ctx, img, stageW, stageH);
+    }
+
+    // ── Scroll-scrub render: draw synchronously within GSAP's RAF tick ──
+    // GSAP's onUpdate already runs inside the browser's RAF. Calling drawFrameNow
+    // directly here (no extra RAF hop) means canvas updates land in the same paint
+    // cycle as the scroll event — eliminating one full frame of visual lag.
+    function renderFrameScroll(index: number) {
+      pendingScrollFrame = index;
+      drawFrameNow(pendingScrollFrame);
+    }
+
+    // ── Resize-triggered render: uses its own RAF slot to avoid layout thrashing ──
+    function renderFrameAsync(index: number) {
+      if (rafId !== null) cancelAnimationFrame(rafId);
       rafId = requestAnimationFrame(() => {
         rafId = null;
-        let candidateIdx = Math.max(0, Math.min(index, total - 1));
-
-        // Find nearest loaded frame if current isn't ready
-        while (candidateIdx >= 0 && cache[candidateIdx] === null) {
-          candidateIdx--;
-        }
-        if (candidateIdx < 0) {
-          candidateIdx = cache.findIndex((item) => item !== null);
-          if (candidateIdx < 0) return;
-        }
-
-        const img = cache[candidateIdx];
-        if (!img) return;
-
-        const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        const stageW = canvas.width / dpr;
-        const stageH = canvas.height / dpr;
-
-        ctx.clearRect(0, 0, stageW, stageH);
-        drawCover(ctx, img, stageW, stageH);
+        drawFrameNow(index);
       });
     }
+
+    // Legacy alias for preloader callbacks that run outside GSAP RAF
+    const renderFrame = renderFrameAsync;
 
     // Load individual frame
     function loadSingleFrame(index: number): Promise<void> {
@@ -294,42 +350,83 @@ export function HeroSection() {
       trigger: track,
       start: "top top",
       end: "bottom bottom",
-      scrub: 0.4, // ultra-smooth cinematic response
+      // scrub: 0.1 gives a crisp, near-zero-lag response while still smoothing
+      // micro-jitter from trackpads. At 0.4 (the old value) there was ~400ms
+      // of intentional lag built into every scroll interaction.
+      scrub: 0.1,
       onUpdate(self) {
         const p = self.progress;
         const pct = p * 100;
 
-        // Top progress indicator
+        // ── Top progress indicator — direct DOM mutation, no React state ──
         if (progressLineRef.current) {
           progressLineRef.current.style.transform = `scaleX(${p})`;
         }
 
-        // Scrub frame
-        const targetFrame = Math.min(
-          Math.floor(p * total),
-          total - 1
-        );
-
+        // ── Frame scrub — synchronous draw within GSAP's own RAF tick ──
+        const targetFrame = Math.min(Math.round(p * (total - 1)), total - 1);
         if (targetFrame !== currentFrame) {
           currentFrame = targetFrame;
-          renderFrame(currentFrame);
+          renderFrameScroll(currentFrame);
         }
 
-        // Active narrative chapter sync
-        const activeIdx = CHAPTERS.findIndex(
-          (c) => pct >= c.start && pct <= c.end
-        );
-        if (activeIdx !== -1) {
-          setActiveChapterIndex(activeIdx);
+        // ── Narrative chapter sync — direct DOM, zero React overhead ──
+        const isInFinalCta = pct >= 86;
+        if (isInFinalCta !== showFinalCtaRef.current) {
+          showFinalCtaRef.current = isInFinalCta;
+          setCtaVisible(finalCtaRef.current, isInFinalCta);
+          // Hide all chapter overlays and nav dots when CTA is shown
+          chapterRefsArr.current.forEach((el) => setChapterVisible(el, false));
+          navDotRefsArr.current.forEach((dot, i) => {
+            if (dot) {
+              dot.style.transform = "scaleX(0.27)";
+              dot.style.background = "rgba(255,255,255,0.25)";
+              dot.style.boxShadow = "none";
+            }
+            if (navLabelRefsArr.current[i]) {
+              navLabelRefsArr.current[i]!.style.opacity = "0.45";
+              navLabelRefsArr.current[i]!.style.fontWeight = "400";
+              navLabelRefsArr.current[i]!.style.color = "rgba(255,255,255,0.4)";
+            }
+          });
         }
 
-        // Show CTA near sequence completion
-        setShowFinalCta(pct >= 86);
+        if (!isInFinalCta) {
+          const activeIdx = CHAPTERS.findIndex(
+            (c) => pct >= c.start && pct <= c.end
+          );
+          const nextActive = activeIdx !== -1 ? activeIdx : activeChapterRef.current;
+
+          if (nextActive !== activeChapterRef.current || isInFinalCta !== showFinalCtaRef.current) {
+            chapterRefsArr.current.forEach((el, i) =>
+              setChapterVisible(el, i === nextActive)
+            );
+            navDotRefsArr.current.forEach((dot, i) => {
+              const isActive = i === nextActive;
+              if (dot) {
+                dot.style.transform = isActive ? "scaleX(1)" : "scaleX(0.27)";
+                dot.style.background = isActive
+                  ? "linear-gradient(90deg, #B99A62, #E5CF92)"
+                  : "rgba(255,255,255,0.25)";
+                dot.style.boxShadow = isActive ? "0 0 8px rgba(185,154,98,0.8)" : "none";
+              }
+              if (navLabelRefsArr.current[i]) {
+                navLabelRefsArr.current[i]!.style.opacity = isActive ? "1" : "0.45";
+                navLabelRefsArr.current[i]!.style.fontWeight = isActive ? "600" : "400";
+                navLabelRefsArr.current[i]!.style.color = isActive
+                  ? "#E5CF92"
+                  : "rgba(255,255,255,0.4)";
+              }
+            });
+            activeChapterRef.current = nextActive;
+          }
+        }
       },
     });
 
     return () => {
       if (rafId !== null) cancelAnimationFrame(rafId);
+      if (scrollRafId !== null) cancelAnimationFrame(scrollRafId);
       resizeObserver.disconnect();
       scrollTriggerInstance?.kill();
       cache.forEach((item) => {
@@ -374,6 +471,8 @@ export function HeroSection() {
               width: "100%",
               height: "100%",
               display: "block",
+              willChange: "contents",
+              transform: "translateZ(0)",
             }}
             aria-label="Drone flythrough of Lakshya luxury villa"
           />
@@ -516,20 +615,24 @@ export function HeroSection() {
             }}
           >
             {CHAPTERS.map((chap, i) => {
-              const isCurrent = activeChapterIndex === i && !showFinalCta;
+              // Initial state: chapter 0 visible, rest hidden
+              const isFirst = i === 0;
               return (
                 <div
                   key={chap.chapter}
+                  ref={(el) => { chapterRefsArr.current[i] = el; }}
                   style={{
                     position: "absolute",
                     left: "clamp(1.5rem, 5vw, 4.5rem)",
                     bottom: "clamp(5rem, 12vh, 8.5rem)",
                     maxWidth: "min(640px, 90vw)",
-                    opacity: isCurrent ? 1 : 0,
-                    transform: `translateY(${isCurrent ? 0 : 20}px)`,
+                    // Use GPU-composited properties only — no layout-triggering changes
+                    opacity: isFirst ? 1 : 0,
+                    transform: isFirst ? "translateZ(0)" : "translate3d(0, 20px, 0)",
                     transition:
                       "opacity 0.65s cubic-bezier(0.16, 1, 0.3, 1), transform 0.65s cubic-bezier(0.16, 1, 0.3, 1)",
                     willChange: "opacity, transform",
+                    pointerEvents: isFirst ? "auto" : "none",
                   }}
                 >
                   {/* Chapter badge & gold rule */}
@@ -669,7 +772,7 @@ export function HeroSection() {
             }}
           >
             {CHAPTERS.map((c, i) => {
-              const isActive = activeChapterIndex === i && !showFinalCta;
+              const isFirstNav = i === 0;
               return (
                 <button
                   key={c.chapter}
@@ -690,33 +793,43 @@ export function HeroSection() {
                     alignItems: "center",
                     gap: "10px",
                     cursor: "pointer",
-                    color: isActive ? "#E5CF92" : "rgba(255,255,255,0.4)",
-                    transition: "all 0.3s ease",
+                    // Color is driven by direct DOM ref updates — no re-render needed
+                    color: isFirstNav ? "#E5CF92" : "rgba(255,255,255,0.4)",
+                    transition: "color 0.3s ease",
                   }}
                   title={c.headline}
                 >
                   <span
+                    ref={(el) => { navLabelRefsArr.current[i] = el; }}
                     style={{
                       fontSize: "0.58rem",
                       letterSpacing: "0.18em",
                       fontFamily: "var(--font-sans), sans-serif",
-                      fontWeight: isActive ? 600 : 400,
-                      opacity: isActive ? 1 : 0.45,
+                      // Initial state: first nav label active
+                      fontWeight: isFirstNav ? 600 : 400,
+                      opacity: isFirstNav ? 1 : 0.45,
+                      color: isFirstNav ? "#E5CF92" : "rgba(255,255,255,0.4)",
+                      transition: "opacity 0.35s ease, color 0.35s ease",
                     }}
                     className="hidden sm:inline"
                   >
                     0{i + 1}
                   </span>
+                  {/* Use scaleX instead of width to avoid layout reflow — pure compositor animation */}
                   <div
+                    ref={(el) => { navDotRefsArr.current[i] = el; }}
                     style={{
-                      width: isActive ? "22px" : "6px",
+                      width: "22px",
                       height: "2px",
                       borderRadius: "2px",
-                      background: isActive
+                      transformOrigin: "left center",
+                      // Initial state: first dot active (full width), rest collapsed
+                      transform: isFirstNav ? "scaleX(1)" : "scaleX(0.27)",
+                      background: isFirstNav
                         ? "linear-gradient(90deg, #B99A62, #E5CF92)"
                         : "rgba(255,255,255,0.25)",
-                      boxShadow: isActive ? "0 0 8px rgba(185,154,98,0.8)" : "none",
-                      transition: "all 0.35s cubic-bezier(0.16, 1, 0.3, 1)",
+                      boxShadow: isFirstNav ? "0 0 8px rgba(185,154,98,0.8)" : "none",
+                      transition: "transform 0.35s cubic-bezier(0.16, 1, 0.3, 1), background 0.35s ease, box-shadow 0.35s ease",
                     }}
                   />
                 </button>
@@ -726,15 +839,18 @@ export function HeroSection() {
 
           {/* ══ Final Interactive Call To Action (Triggers at 86%+ scroll) ══ */}
           <div
+            ref={finalCtaRef}
             style={{
               position: "absolute",
               left: "50%",
               bottom: "clamp(5rem, 12vh, 8.5rem)",
-              transform: `translateX(-50%) translateY(${showFinalCta ? "0px" : "20px"})`,
-              opacity: showFinalCta ? 1 : 0,
+              // Initial hidden state — driven by direct DOM mutation, not React state
+              transform: "translateX(-50%) translate3d(0, 20px, 0)",
+              opacity: 0,
               transition:
                 "opacity 0.6s cubic-bezier(0.16, 1, 0.3, 1), transform 0.6s cubic-bezier(0.16, 1, 0.3, 1)",
-              pointerEvents: showFinalCta ? "auto" : "none",
+              pointerEvents: "none",
+              willChange: "opacity, transform",
               zIndex: 35,
               display: "flex",
               flexDirection: "column",
@@ -795,12 +911,17 @@ export function HeroSection() {
       {/* Global Hero Animations */}
       <style>{`
         @keyframes hero-bounce {
-          0%, 100% { transform: translateY(0); }
-          50% { transform: translateY(6px); }
+          0%, 100% { transform: translate3d(0, 0, 0); }
+          50% { transform: translate3d(0, 6px, 0); }
         }
         @keyframes hero-spin {
           0% { transform: rotate(0deg); }
           100% { transform: rotate(360deg); }
+        }
+        /* Promote chapter overlays and CTA to their own compositor layers */
+        [data-hero-overlay] {
+          backface-visibility: hidden;
+          perspective: 1000px;
         }
       `}</style>
     </>
